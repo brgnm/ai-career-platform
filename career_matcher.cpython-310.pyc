@@ -1,0 +1,254 @@
+"""
+ml/transcript_parser.py
+
+Парсит PDF транскрипт и извлекает:
+- GPA, Grand Average
+- Список курсов с оценками
+- Навыки на основе курсов
+"""
+
+import re
+from typing import Dict, List, Optional
+
+
+# ── Маппинг курсов → навыки ───────────────────────────────────────────
+# Если студент прошёл этот курс с оценкой B или выше — добавляем навык.
+COURSE_TO_SKILLS = {
+    "machine learning":              ["Machine Learning", "Python", "scikit-learn"],
+    "deep learning":                 ["Deep Learning", "Neural Networks", "PyTorch"],
+    "natural language processing":   ["NLP", "Text Processing", "Transformers"],
+    "python for data analysis":      ["Python", "Pandas", "NumPy", "Data Analysis"],
+    "data analysis":                 ["Data Analysis", "Statistics", "Visualization"],
+    "data visuali":                  ["Data Visualization", "Storytelling"],
+    "probability":                   ["Statistics", "Probability", "Mathematical Analysis"],
+    "algorithms":                    ["Algorithms", "Data Structures", "Problem Solving"],
+    "software architecture":         ["Software Architecture", "Design Patterns", "OOP"],
+    "operating systems":             ["Operating Systems", "System Programming"],
+    "information security":          ["Cybersecurity", "Information Security", "Cryptography"],
+    "database":                      ["SQL", "Databases", "Data Modeling"],
+    "computer networks":             ["Networking", "Protocols", "TCP/IP"],
+    "programming technologies":      ["Programming", "Software Development"],
+    "fundamentals of programming":   ["Programming", "Problem Solving"],
+    "linear algebra":                ["Linear Algebra", "Mathematics"],
+    "discrete mathematics":          ["Discrete Mathematics", "Logic"],
+    "project management":            ["Project Management", "Agile"],
+    "business":                      ["Business Analysis", "IT Management"],
+    "financial literacy":            ["Financial Literacy", "Business"],
+}
+
+# Оценки, при которых засчитываем навык
+PASSING_GRADES = {"A", "A-", "B+", "B", "B-", "C+", "C"}
+
+
+def parse_transcript_text(raw_text: str) -> Dict:
+    """
+    Парсит сырой текст транскрипта (полученный через pdfplumber).
+
+    Returns:
+        {
+            "gpa": 3.38,
+            "grand_avg": 87.51,
+            "total_credits": 104,
+            "courses": [{"code", "title", "score", "grade", "credits", "semester"}],
+        }
+    """
+    result = {
+        "gpa": None,
+        "grand_avg": None,
+        "total_credits": None,
+        "courses": [],
+    }
+
+    # ── GPA ──────────────────────────────────────────────────────────
+    gpa_match = re.search(r"Grand GPA\s*[:\s]+([0-9.]+)", raw_text, re.IGNORECASE)
+    if gpa_match:
+        result["gpa"] = float(gpa_match.group(1))
+
+    avg_match = re.search(r"Grand Average\s*[:\s]+([0-9.]+)", raw_text, re.IGNORECASE)
+    if avg_match:
+        result["grand_avg"] = float(avg_match.group(1))
+
+    credits_match = re.search(r"Total Internal Credits\s*[:\s]+([0-9]+)", raw_text, re.IGNORECASE)
+    if credits_match:
+        result["total_credits"] = int(credits_match.group(1))
+
+    # ── Определяем текущий семестр ────────────────────────────────────
+    current_semester = "Unknown"
+    semester_pattern = re.compile(r"(\d{4}\s*-\s*\d{4}\.\s*[12])", re.IGNORECASE)
+
+    # ── Курсы ─────────────────────────────────────────────────────────
+    # Паттерн строки курса: CODE  TITLE  credits  ects  score  GRADE  points  trad
+    course_pattern = re.compile(
+        r"([A-Z]{2,4}\s+\d{3}[A-Z]?)\s+"   # код курса
+        r"(.+?)\s+"                           # название (жадно)
+        r"(\d+)\s+\d+\s+"                    # credits, ects
+        r"(\d{1,3}|—)\s+"                    # score
+        r"([A-Z][+-]?|IP|P|NP)\s+"           # letter grade
+        r"([0-9.]+|—)",                       # points
+        re.MULTILINE
+    )
+
+    lines = raw_text.split("\n")
+    for line in lines:
+        # Обновляем текущий семестр
+        sem_match = semester_pattern.search(line)
+        if sem_match:
+            current_semester = sem_match.group(1).strip()
+            continue
+
+        m = course_pattern.search(line)
+        if m:
+            code, title, credits, score_raw, grade, points_raw = m.groups()
+
+            score = None
+            if score_raw and score_raw != "—":
+                try:
+                    score = int(score_raw)
+                except ValueError:
+                    pass
+
+            result["courses"].append({
+                "code":     code.strip(),
+                "title":    title.strip(),
+                "credits":  int(credits),
+                "score":    score,
+                "grade":    grade.strip(),
+                "semester": current_semester,
+            })
+
+    return result
+
+
+def extract_skills_from_courses(courses: List[Dict]) -> List[str]:
+    """
+    Из списка курсов извлекает навыки студента.
+    Учитывает только курсы с проходной оценкой.
+    """
+    skills = set()
+
+    for course in courses:
+        grade = course.get("grade", "")
+        title = course.get("title", "").lower()
+
+        # Засчитываем только если оценка хорошая
+        if grade not in PASSING_GRADES:
+            continue
+
+        for keyword, skill_list in COURSE_TO_SKILLS.items():
+            if keyword in title:
+                skills.update(skill_list)
+
+    return sorted(list(skills))
+
+
+def compute_skill_scores(courses: List[Dict]) -> Dict[str, float]:
+    """
+    Вычисляет процент владения по категориям навыков.
+    Используется для radar chart на дашборде.
+    """
+    categories = {
+        "Machine Learning & AI": [],
+        "Data & Statistics":     [],
+        "Programming":           [],
+        "Mathematics":           [],
+        "NLP":                   [],
+        "Security & Networks":   [],
+    }
+
+    CATEGORY_KEYWORDS = {
+        "Machine Learning & AI": ["machine learning", "deep learning", "artificial"],
+        "Data & Statistics":     ["data analysis", "probability", "statistics", "visuali"],
+        "Programming":           ["programming", "algorithms", "software", "operating"],
+        "Mathematics":           ["mathematics", "linear algebra", "discrete"],
+        "NLP":                   ["natural language", "nlp"],
+        "Security & Networks":   ["security", "networks", "network"],
+    }
+
+    grade_to_score = {
+        "A": 100, "A-": 92, "B+": 87, "B": 83,
+        "B-": 77, "C+": 73, "C": 67, "IP": 70,
+    }
+
+    for course in courses:
+        title = course.get("title", "").lower()
+        grade = course.get("grade", "")
+        score = grade_to_score.get(grade, course.get("score") or 70)
+
+        for category, keywords in CATEGORY_KEYWORDS.items():
+            if any(kw in title for kw in keywords):
+                categories[category].append(score)
+
+    # Среднее по каждой категории
+    result = {}
+    for category, scores in categories.items():
+        if scores:
+            result[category] = round(sum(scores) / len(scores))
+        else:
+            result[category] = 60  # базовое значение если нет курсов
+
+    return result
+
+
+def compute_readiness_score(
+    gpa: float,
+    skills: List[str],
+    courses: List[Dict],
+) -> float:
+    """
+    Итоговый Career Readiness Score (0–100).
+
+    Формула:
+    - 35% GPA (нормализованный)
+    - 30% количество и качество релевантных навыков
+    - 20% оценки в ключевых курсах
+    - 15% общий прогресс (количество кредитов)
+    """
+    # 1. GPA компонент (0–35)
+    gpa_component = (gpa / 4.0) * 35
+
+    # 2. Навыки (0–30): каждый уникальный навык = 2 балла, макс 30
+    skill_component = min(len(skills) * 2, 30)
+
+    # 3. Оценки в ключевых курсах (0–20)
+    key_course_scores = []
+    key_keywords = ["machine learning", "deep learning", "nlp", "data", "algorithms", "security"]
+    grade_map = {"A": 100, "A-": 92, "B+": 87, "B": 83, "B-": 77, "C+": 73}
+
+    for course in courses:
+        title = course.get("title", "").lower()
+        grade = course.get("grade", "")
+        if any(kw in title for kw in key_keywords) and grade in grade_map:
+            key_course_scores.append(grade_map[grade])
+
+    if key_course_scores:
+        avg_key = sum(key_course_scores) / len(key_course_scores)
+        grade_component = (avg_key / 100) * 20
+    else:
+        grade_component = 10  # базовый балл
+
+    # 4. Прогресс (0–15)
+    total_credits = sum(c.get("credits", 0) for c in courses if c.get("grade") not in ("IP", "P", "NP"))
+    progress_component = min(total_credits / 120 * 15, 15)
+
+    total = gpa_component + skill_component + grade_component + progress_component
+    return round(min(total, 100), 1)
+
+
+def parse_pdf_transcript(file_bytes: bytes) -> Dict:
+    """
+    Полный пайплайн: PDF байты → структурированные данные.
+    Используй эту функцию в FastAPI роутере.
+    """
+    try:
+        import pdfplumber
+        import io
+
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            raw_text = "\n".join(
+                page.extract_text() or "" for page in pdf.pages
+            )
+
+        return parse_transcript_text(raw_text)
+
+    except ImportError:
+        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
